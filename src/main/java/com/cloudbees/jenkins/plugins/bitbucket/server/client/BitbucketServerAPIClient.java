@@ -62,6 +62,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
@@ -69,21 +70,35 @@ import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.scm.api.SCMFile;
 import net.sf.json.JSONObject;
-import org.apache.commons.httpclient.Header;
-import org.apache.commons.httpclient.HttpClient;
-import org.apache.commons.httpclient.HttpMethod;
-import org.apache.commons.httpclient.HttpStatus;
-import org.apache.commons.httpclient.NameValuePair;
-import org.apache.commons.httpclient.URIException;
-import org.apache.commons.httpclient.UsernamePasswordCredentials;
-import org.apache.commons.httpclient.auth.AuthScope;
-import org.apache.commons.httpclient.methods.DeleteMethod;
-import org.apache.commons.httpclient.methods.GetMethod;
-import org.apache.commons.httpclient.methods.PostMethod;
-import org.apache.commons.httpclient.methods.PutMethod;
-import org.apache.commons.httpclient.methods.StringRequestEntity;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.StringUtils;
+import org.apache.http.Header;
+import org.apache.http.HttpHost;
+import org.apache.http.HttpStatus;
+import org.apache.http.NameValuePair;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
+import org.apache.http.client.methods.HttpRequestBase;
+import org.apache.http.config.SocketConfig;
+import org.apache.http.conn.params.ConnRoutePNames;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.util.EntityUtils;
 import org.codehaus.jackson.type.TypeReference;
 import static com.cloudbees.jenkins.plugins.bitbucket.Utils.encodePath;
 
@@ -308,7 +323,7 @@ public class BitbucketServerAPIClient implements BitbucketApi {
      */
     @Override
     public void postCommitComment(@NonNull String hash, @NonNull String comment) throws IOException {
-        postRequest(String.format(API_COMMIT_COMMENT_PATH, getUserCentricOwner(), repositoryName, hash), new NameValuePair[]{ new NameValuePair("text", comment) });
+        postRequest(String.format(API_COMMIT_COMMENT_PATH, getUserCentricOwner(), repositoryName, hash), Arrays.asList(new BasicNameValuePair("text", comment)));
     }
 
     /**
@@ -493,14 +508,13 @@ public class BitbucketServerAPIClient implements BitbucketApi {
     }
 
     private String getRequest(String path) throws IOException {
-        GetMethod httpget = new GetMethod(this.baseURL + path);
-        HttpClient client = getHttpClient(getMethodHost(httpget));
-        try {
-            client.executeMethod(httpget);
-            String response;
-            long len = httpget.getResponseContentLength();
+        HttpGet httpget = new HttpGet(this.baseURL + path);
+
+        try(CloseableHttpClient client = getHttpClient(getMethodHost(httpget)); CloseableHttpResponse response = client.execute(httpget)) {
+            String content;
+            long len = response.getEntity().getContentLength();
             if (len == 0) {
-                response = "";
+                content = "";
             } else {
                 ByteArrayOutputStream buf;
                 if (len > 0 && len <= Integer.MAX_VALUE / 2) {
@@ -508,20 +522,21 @@ public class BitbucketServerAPIClient implements BitbucketApi {
                 } else {
                     buf = new ByteArrayOutputStream();
                 }
-                try (InputStream is = httpget.getResponseBodyAsStream()) {
+                try (InputStream is = response.getEntity().getContent()) {
                     IOUtils.copy(is, buf);
                 }
-                response = new String(buf.toByteArray(), StandardCharsets.UTF_8);
+                content = new String(buf.toByteArray(), StandardCharsets.UTF_8);
             }
-            if (httpget.getStatusCode() == HttpStatus.SC_NOT_FOUND) {
+            EntityUtils.consume(response.getEntity());
+            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NOT_FOUND) {
                 throw new FileNotFoundException("URL: " + path);
             }
-            if (httpget.getStatusCode() != HttpStatus.SC_OK) {
-                throw new BitbucketRequestException(httpget.getStatusCode(),
-                        "HTTP request error. Status: " + httpget.getStatusCode()
-                                + ": " + httpget.getStatusText() + ".\n" + response);
+            if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
+                throw new BitbucketRequestException(response.getStatusLine().getStatusCode(),
+                        "HTTP request error. Status: " + response.getStatusLine().getStatusCode()
+                                + ": " + response.getStatusLine().getReasonPhrase() + ".\n" + response);
             }
-            return response;
+            return content;
         } catch (BitbucketRequestException | FileNotFoundException e) {
             throw e;
         } catch (IOException e) {
@@ -531,24 +546,21 @@ public class BitbucketServerAPIClient implements BitbucketApi {
         }
     }
 
-    private HttpClient getHttpClient(String host) {
-        HttpClient client = new HttpClient();
-
-        client.getParams().setConnectionManagerTimeout(10 * 1000);
-        client.getParams().setSoTimeout(60 * 1000);
+    private CloseableHttpClient getHttpClient(String host) {
+        HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
 
         if (credentials != null) {
-            client.getState().setCredentials(AuthScope.ANY, credentials);
-            client.getParams().setAuthenticationPreemptive(true);
-        } else {
-            client.getParams().setAuthenticationPreemptive(false);
+            CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+            credentialsProvider.setCredentials(AuthScope.ANY, credentials);
+            httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
         }
 
-        setClientProxyParams(host, client);
-        return client;
+        setClientProxyParams(host, httpClientBuilder);
+
+        return httpClientBuilder.build();
     }
 
-    private static void setClientProxyParams(String host, HttpClient client) {
+    private static void setClientProxyParams(String host, HttpClientBuilder builder) {
         Jenkins jenkins = Jenkins.getInstance();
         ProxyConfiguration proxyConfig = null;
         if (jenkins != null) {
@@ -563,46 +575,43 @@ public class BitbucketServerAPIClient implements BitbucketApi {
         if (proxy.type() != Proxy.Type.DIRECT) {
             final InetSocketAddress proxyAddress = (InetSocketAddress)proxy.address();
             LOGGER.log(Level.FINE, "Jenkins proxy: {0}", proxy.address());
-            client.getHostConfiguration().setProxy(proxyAddress.getHostString(), proxyAddress.getPort());
+            builder.setProxy(new HttpHost(proxyAddress.getHostName(), proxyAddress.getPort()));
             String username = proxyConfig.getUserName();
             String password = proxyConfig.getPassword();
             if (username != null && !"".equals(username.trim())) {
                 LOGGER.log(Level.FINE, "Using proxy authentication (user={0})", username);
-                client.getState().setProxyCredentials(AuthScope.ANY,
-                    new UsernamePasswordCredentials(username, password));
+                CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(username, password));
+                builder.setDefaultCredentialsProvider(credentialsProvider);
             }
         }
     }
 
     private int getRequestStatus(String path) throws IOException {
-        GetMethod httpget = new GetMethod(this.baseURL + path);
-        HttpClient client = getHttpClient(getMethodHost(httpget));
-        try {
-            client.executeMethod(httpget);
-            return httpget.getStatusCode();
+        HttpGet httpget = new HttpGet(this.baseURL + path);
+
+        try(CloseableHttpClient client = getHttpClient(getMethodHost(httpget)); CloseableHttpResponse response = client.execute(httpget)) {
+            EntityUtils.consume(response.getEntity());
+            return response.getStatusLine().getStatusCode();
         } finally {
             httpget.releaseConnection();
         }
     }
 
-    private static String getMethodHost(HttpMethod method) {
-        try {
-            return method.getURI().getHost();
-        } catch (URIException e) {
-            throw new IllegalStateException("Could not obtain host part for method " + method, e);
-        }
+    private static String getMethodHost(HttpRequestBase method) {
+        return method.getURI().getHost();
     }
 
-    private String postRequest(String path, NameValuePair[] params) throws IOException {
-        PostMethod httppost = new PostMethod(this.baseURL + path);
-        httppost.setRequestEntity(new StringRequestEntity(nameValueToJson(params), "application/json", "UTF-8"));
-        return postRequest(httppost);
+    private String postRequest(String path, List<? extends NameValuePair> params) throws IOException {
+        HttpPost request = new HttpPost(this.baseURL + path);
+        request.setEntity(new UrlEncodedFormEntity(params));
+        return postRequest(request);
     }
 
     private String postRequest(String path, String content) throws IOException {
-        PostMethod httppost = new PostMethod(this.baseURL + path);
-        httppost.setRequestEntity(new StringRequestEntity(content, "application/json", "UTF-8"));
-        return postRequest(httppost);
+        HttpPost request = new HttpPost(this.baseURL + path);
+        request.setEntity(new StringEntity(content, ContentType.create("application/json", "UTF-8")));
+        return postRequest(request);
     }
 
     private String nameValueToJson(NameValuePair[] params) {
@@ -613,23 +622,26 @@ public class BitbucketServerAPIClient implements BitbucketApi {
         return o.toString();
     }
 
-    private String postRequest(PostMethod httppost) throws IOException {
+    private String postRequest(HttpPost httppost) throws IOException {
         return doRequest(httppost);
     }
 
-    private String doRequest(HttpMethod httppost) throws IOException {
-        HttpClient client = getHttpClient(getMethodHost(httppost));
-        client.getState().setCredentials(AuthScope.ANY, credentials);
-        client.getParams().setAuthenticationPreemptive(true);
-        try {
-            client.executeMethod(httppost);
-            if (httppost.getStatusCode() == HttpStatus.SC_NO_CONTENT) {
+    private String doRequest(HttpRequestBase request) throws IOException {
+        RequestConfig.Builder requestConfig = RequestConfig.custom();
+        requestConfig.setConnectTimeout(10 * 1000);
+        requestConfig.setConnectionRequestTimeout(60 * 1000);
+        requestConfig.setSocketTimeout(60 * 1000);
+        request.setConfig(requestConfig.build());
+
+        try(CloseableHttpClient client = getHttpClient(getMethodHost(request)); CloseableHttpResponse response = client.execute(request)) {
+            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NO_CONTENT) {
+                EntityUtils.consume(response.getEntity());
                 // 204, no content
                 return "";
             }
-            String response;
+            String content;
             long len = -1L;
-            Header[] headers = httppost.getResponseHeaders("Content-Length");
+            Header[] headers = request.getHeaders("Content-Length");
             if (headers != null && headers.length > 0) {
                 int i = headers.length - 1;
                 len = -1L;
@@ -644,7 +656,7 @@ public class BitbucketServerAPIClient implements BitbucketApi {
                 }
             }
             if (len == 0) {
-                response = "";
+                content = "";
             } else {
                 ByteArrayOutputStream buf;
                 if (len > 0 && len <= Integer.MAX_VALUE / 2) {
@@ -652,28 +664,29 @@ public class BitbucketServerAPIClient implements BitbucketApi {
                 } else {
                     buf = new ByteArrayOutputStream();
                 }
-                try (InputStream is = httppost.getResponseBodyAsStream()) {
+                try (InputStream is = response.getEntity().getContent()) {
                     IOUtils.copy(is, buf);
                 }
-                response = new String(buf.toByteArray(), StandardCharsets.UTF_8);
+                content = new String(buf.toByteArray(), StandardCharsets.UTF_8);
             }
-            if (httppost.getStatusCode() != HttpStatus.SC_OK && httppost.getStatusCode() != HttpStatus.SC_CREATED) {
-                throw new BitbucketRequestException(httppost.getStatusCode(), "HTTP request error. Status: " + httppost.getStatusCode() + ": " + httppost.getStatusText() + ".\n" + response);
+            EntityUtils.consume(response.getEntity());
+            if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK && response.getStatusLine().getStatusCode() != HttpStatus.SC_CREATED) {
+                throw new BitbucketRequestException(response.getStatusLine().getStatusCode(), "HTTP request error. Status: " + response.getStatusLine().getStatusCode() + ": " + response.getStatusLine().getReasonPhrase() + ".\n" + response);
             }
-            return response;
+            return content;
         } finally {
-            httppost.releaseConnection();
+            request.releaseConnection();
         }
     }
 
     private String putRequest(String path, String content) throws IOException {
-        PutMethod request = new PutMethod(this.baseURL + path);
-        request.setRequestEntity(new StringRequestEntity(content, "application/json", "UTF-8"));
+        HttpPut request = new HttpPut(this.baseURL + path);
+        request.setEntity(new StringEntity(content, ContentType.create("application/json", "UTF-8")));
         return doRequest(request);
     }
 
     private String deleteRequest(String path) throws IOException {
-        DeleteMethod request = new DeleteMethod(this.baseURL + path);
+        HttpDelete request = new HttpDelete(this.baseURL + path);
         return doRequest(request);
     }
 
