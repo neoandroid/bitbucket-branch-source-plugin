@@ -579,6 +579,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
 
         CloseableHttpResponse response = client.execute(API_HOST, httpMethod, context);
         while (response.getStatusLine().getStatusCode() == API_RATE_LIMIT_CODE) {
+            release(httpMethod);
             if (Thread.interrupted()) {
                 throw new InterruptedException();
             }
@@ -601,15 +602,20 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         try {
             CloseableHttpResponse response =  executeMethod(httpget);
             if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NOT_FOUND) {
+                EntityUtils.consume(response.getEntity());
+                response.close();
                 throw new FileNotFoundException("URL: " + path);
             }
-            InputStream responseStream =  response.getEntity().getContent();
             if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
-                throw new BitbucketRequestException(response.getStatusLine().getStatusCode(),
-                        "HTTP request error. Status: " + response.getStatusLine().getStatusCode() + ": " + response.getStatusLine().getReasonPhrase()
-                                + ".\n" + IOUtils.toString(responseStream));
+                String content = IOUtils.toString(response.getEntity().getContent());
+                int statusCode = response.getStatusLine().getStatusCode();
+                String status = response.getStatusLine().getReasonPhrase();
+                EntityUtils.consume(response.getEntity());
+                response.close();
+                throw new BitbucketRequestException(statusCode,
+                        "HTTP request error. Status: " + statusCode + ": " + status + ".\n" + content);
             }
-            return responseStream;
+            return new ClosingConnectionInputStream(response, httpget, connectionManager);
         } catch (BitbucketRequestException | FileNotFoundException e) {
             throw e;
         } catch (IOException e) {
@@ -631,7 +637,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         } catch (IOException e) {
             throw new IOException("Communication error for url: " + path, e);
         } finally {
-            httpHead.releaseConnection();
+            release(httpHead);
         }
     }
 
@@ -650,7 +656,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         } catch (IOException e) {
             throw new IOException("Communication error for url: " + path, e);
         } finally {
-            httppost.releaseConnection();
+            release(httppost);
         }
     }
 
@@ -676,9 +682,13 @@ public class BitbucketCloudApiClient implements BitbucketApi {
                 throw new IOException("Communication error", e);
             }
         } finally {
-            httppost.releaseConnection();
+            release(httppost);
         }
+    }
 
+    private void release(HttpRequestBase method) {
+        method.releaseConnection();
+        connectionManager.closeExpiredConnections();
     }
 
     private String getResponseContent(CloseableHttpResponse response) throws IOException {
