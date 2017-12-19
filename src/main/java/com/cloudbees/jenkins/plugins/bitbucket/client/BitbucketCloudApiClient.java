@@ -64,6 +64,7 @@ import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -72,38 +73,55 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.scm.api.SCMFile;
-import org.apache.commons.httpclient.HttpClient;
-import org.apache.commons.httpclient.HttpMethod;
-import org.apache.commons.httpclient.HttpMethodBase;
-import org.apache.commons.httpclient.HttpStatus;
-import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
-import org.apache.commons.httpclient.NameValuePair;
-import org.apache.commons.httpclient.UsernamePasswordCredentials;
-import org.apache.commons.httpclient.auth.AuthScope;
-import org.apache.commons.httpclient.methods.DeleteMethod;
-import org.apache.commons.httpclient.methods.GetMethod;
-import org.apache.commons.httpclient.methods.HeadMethod;
-import org.apache.commons.httpclient.methods.PostMethod;
-import org.apache.commons.httpclient.methods.PutMethod;
-import org.apache.commons.httpclient.methods.StringRequestEntity;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.StringUtils;
+import org.apache.http.HttpHost;
+import org.apache.http.HttpStatus;
+import org.apache.http.NameValuePair;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.AuthCache;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
+import org.apache.http.client.methods.HttpRequestBase;
+import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.config.SocketConfig;
+import org.apache.http.entity.ContentType;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.auth.BasicScheme;
+import org.apache.http.impl.client.BasicAuthCache;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.util.EntityUtils;
 import org.codehaus.jackson.type.TypeReference;
 import static com.cloudbees.jenkins.plugins.bitbucket.Utils.encodePath;
 
 public class BitbucketCloudApiClient implements BitbucketApi {
     private static final Logger LOGGER = Logger.getLogger(BitbucketCloudApiClient.class.getName());
+    private static final HttpHost API_HOST = HttpHost.create("https://api.bitbucket.org");
     private static final String V2_API_BASE_URL = "https://api.bitbucket.org/2.0/repositories/";
     private static final String V2_TEAMS_API_BASE_URL = "https://api.bitbucket.org/2.0/teams/";
     private static final int API_RATE_LIMIT_CODE = 429;
-    private HttpClient client;
-    private static final MultiThreadedHttpConnectionManager connectionManager = new MultiThreadedHttpConnectionManager();
+    private static final PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager();
+    private CloseableHttpClient client;
+    private HttpClientContext context;
     private final String owner;
     private final String repositoryName;
     private final UsernamePasswordCredentials credentials;
     static {
-        connectionManager.getParams().setDefaultMaxConnectionsPerHost(20);
-        connectionManager.getParams().setMaxTotalConnections(22);
+        connectionManager.setDefaultMaxPerRoute(20);
+        connectionManager.setMaxTotal(22);
+        connectionManager.setSocketConfig(API_HOST, SocketConfig.custom().setSoTimeout(60 * 1000).build());
     }
 
     public BitbucketCloudApiClient(String owner, String repositoryName, StandardUsernamePasswordCredentials creds) {
@@ -116,19 +134,32 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         this.repositoryName = repositoryName;
 
         // Create Http client
-        HttpClient client = new HttpClient(connectionManager);
-        client.getParams().setConnectionManagerTimeout(10 * 1000);
-        client.getParams().setSoTimeout(60 * 1000);
+        HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
+        httpClientBuilder.setConnectionManager(connectionManager);
+        httpClientBuilder.setConnectionManagerShared(true);
 
         if (credentials != null) {
-            client.getState().setCredentials(AuthScope.ANY, credentials);
-            client.getParams().setAuthenticationPreemptive(true);
-        } else {
-            client.getParams().setAuthenticationPreemptive(false);
+            CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+            credentialsProvider.setCredentials(AuthScope.ANY, credentials);
+            AuthCache authCache = new BasicAuthCache();
+            authCache.put(API_HOST, new BasicScheme());
+            context = HttpClientContext.create();
+            context.setCredentialsProvider(credentialsProvider);
+            context.setAuthCache(authCache);
         }
 
-        setClientProxyParams("bitbucket.org", client);
-        this.client = client;
+        setClientProxyParams("bitbucket.org", httpClientBuilder);
+
+        this.client = httpClientBuilder.build();
+    }
+
+    @Override
+    protected void finalize() throws Throwable {
+        if (client != null) {
+            client.close();
+        }
+
+        super.finalize();
     }
 
     /**
@@ -267,8 +298,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
     public void postCommitComment(@NonNull String hash, @NonNull String comment) throws IOException, InterruptedException {
         String path = V2_API_BASE_URL + this.owner + "/" + this.repositoryName + "/commit/" + hash + "/build";
         try {
-            NameValuePair content = new NameValuePair("content", comment);
-            postRequest(path, new NameValuePair[]{ content });
+            postRequest(path, Arrays.asList(new BasicNameValuePair("content", comment)));
         } catch (UnsupportedEncodingException e) {
             throw e;
         } catch (IOException e) {
@@ -522,7 +552,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         return getRepositories(null);
     }
 
-    private static void setClientProxyParams(String host, HttpClient client) {
+    private void setClientProxyParams(String host, HttpClientBuilder builder) {
         Jenkins jenkins = Jenkins.getInstance();
         ProxyConfiguration proxyConfig = null;
         if (jenkins != null) {
@@ -537,20 +567,32 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         if (proxy.type() != Proxy.Type.DIRECT) {
             final InetSocketAddress proxyAddress = (InetSocketAddress) proxy.address();
             LOGGER.fine("Jenkins proxy: " + proxy.address());
-            client.getHostConfiguration().setProxy(proxyAddress.getHostString(), proxyAddress.getPort());
+            builder.setProxy(new HttpHost(proxyAddress.getHostName(), proxyAddress.getPort()));
             String username = proxyConfig.getUserName();
             String password = proxyConfig.getPassword();
             if (username != null && !"".equals(username.trim())) {
                 LOGGER.fine("Using proxy authentication (user=" + username + ")");
-                client.getState().setProxyCredentials(AuthScope.ANY,
-                        new UsernamePasswordCredentials(username, password));
+                CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(username, password));
+                AuthCache authCache = new BasicAuthCache();
+                authCache.put(HttpHost.create(proxyAddress.getHostName()), new BasicScheme());
+                context = HttpClientContext.create();
+                context.setCredentialsProvider(credentialsProvider);
+                context.setAuthCache(authCache);
             }
         }
     }
 
-    private int executeMethod(HttpMethod httpMethod) throws InterruptedException, IOException {
-        int status = client.executeMethod(httpMethod);
-        while (status == API_RATE_LIMIT_CODE) {
+    private CloseableHttpResponse executeMethod(HttpRequestBase httpMethod) throws InterruptedException, IOException {
+        RequestConfig.Builder requestConfig = RequestConfig.custom();
+        requestConfig.setConnectTimeout(10 * 1000);
+        requestConfig.setConnectionRequestTimeout(60 * 1000);
+        requestConfig.setSocketTimeout(60 * 1000);
+        httpMethod.setConfig(requestConfig.build());
+
+        CloseableHttpResponse response = client.execute(API_HOST, httpMethod, context);
+        while (response.getStatusLine().getStatusCode() == API_RATE_LIMIT_CODE) {
+            release(httpMethod);
             if (Thread.interrupted()) {
                 throw new InterruptedException();
             }
@@ -560,28 +602,33 @@ public class BitbucketCloudApiClient implements BitbucketApi {
              */
             LOGGER.fine("Bitbucket Cloud API rate limit reached, sleeping for 5 sec then retry...");
             Thread.sleep(5000);
-            status = client.executeMethod(httpMethod);
+            response = client.execute(API_HOST, httpMethod, context);
         }
-        return status;
+        return response;
     }
 
     /**
      * Caller's responsbile to close the InputStream.
      */
     private InputStream getRequestAsInputStream(String path) throws IOException, InterruptedException {
-        GetMethod httpget = new GetMethod(path);
+        HttpGet httpget = new HttpGet(path);
         try {
-            executeMethod(httpget);
-            if (httpget.getStatusCode() == HttpStatus.SC_NOT_FOUND) {
+            CloseableHttpResponse response =  executeMethod(httpget);
+            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NOT_FOUND) {
+                EntityUtils.consume(response.getEntity());
+                response.close();
                 throw new FileNotFoundException("URL: " + path);
             }
-            InputStream response =  httpget.getResponseBodyAsStream();
-            if (httpget.getStatusCode() != HttpStatus.SC_OK) {
-                throw new BitbucketRequestException(httpget.getStatusCode(),
-                        "HTTP request error. Status: " + httpget.getStatusCode() + ": " + httpget.getStatusText()
-                                + ".\n" + IOUtils.toString(response));
+            if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK) {
+                String content = IOUtils.toString(response.getEntity().getContent());
+                int statusCode = response.getStatusLine().getStatusCode();
+                String status = response.getStatusLine().getReasonPhrase();
+                EntityUtils.consume(response.getEntity());
+                response.close();
+                throw new BitbucketRequestException(statusCode,
+                        "HTTP request error. Status: " + statusCode + ": " + status + ".\n" + content);
             }
-            return response;
+            return new ClosingConnectionInputStream(response, httpget, connectionManager);
         } catch (BitbucketRequestException | FileNotFoundException e) {
             throw e;
         } catch (IOException e) {
@@ -596,47 +643,49 @@ public class BitbucketCloudApiClient implements BitbucketApi {
     }
 
     private int headRequestStatus(String path) throws IOException, InterruptedException {
-        HeadMethod httpHead = new HeadMethod(path);
-        try {
-            return executeMethod(httpHead);
+        HttpHead httpHead = new HttpHead(path);
+        try(CloseableHttpResponse response = executeMethod(httpHead)) {
+            EntityUtils.consume(response.getEntity());
+            return response.getStatusLine().getStatusCode();
         } catch (IOException e) {
             throw new IOException("Communication error for url: " + path, e);
         } finally {
-            httpHead.releaseConnection();
+            release(httpHead);
         }
     }
 
     private void deleteRequest(String path) throws IOException, InterruptedException {
-        DeleteMethod httppost = new DeleteMethod(path);
-        try {
-            executeMethod(httppost);
-            if (httppost.getStatusCode() == HttpStatus.SC_NOT_FOUND) {
+        HttpDelete httppost = new HttpDelete(path);
+        try(CloseableHttpResponse response =  executeMethod(httppost)) {
+            EntityUtils.consume(response.getEntity());
+            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NOT_FOUND) {
                 throw new FileNotFoundException("URL: " + path);
             }
-            if (httppost.getStatusCode() != HttpStatus.SC_NO_CONTENT) {
-                throw new BitbucketRequestException(httppost.getStatusCode(), "HTTP request error. Status: " + httppost.getStatusCode() + ": " + httppost.getStatusText());
+            if (response.getStatusLine().getStatusCode() != HttpStatus.SC_NO_CONTENT) {
+                throw new BitbucketRequestException(response.getStatusLine().getStatusCode(), "HTTP request error. Status: " + response.getStatusLine().getStatusCode() + ": " + response.getStatusLine().getReasonPhrase());
             }
         } catch (BitbucketRequestException e) {
             throw e;
         } catch (IOException e) {
             throw new IOException("Communication error for url: " + path, e);
         } finally {
-            httppost.releaseConnection();
+            release(httppost);
         }
     }
 
-    private String doRequest(HttpMethodBase httppost) throws IOException, InterruptedException {
-        try {
-            executeMethod(httppost);
-            if (httppost.getStatusCode() == HttpStatus.SC_NO_CONTENT) {
+    private String doRequest(HttpRequestBase httppost) throws IOException, InterruptedException {
+        try(CloseableHttpResponse response =  executeMethod(httppost)) {
+            if (response.getStatusLine().getStatusCode() == HttpStatus.SC_NO_CONTENT) {
+                EntityUtils.consume(response.getEntity());
                 // 204, no content
                 return "";
             }
-            String response = getResponseContent(httppost, httppost.getResponseContentLength());
-            if (httppost.getStatusCode() != HttpStatus.SC_OK && httppost.getStatusCode() != HttpStatus.SC_CREATED) {
-                throw new BitbucketRequestException(httppost.getStatusCode(), "HTTP request error. Status: " + httppost.getStatusCode() + ": " + httppost.getStatusText() + ".\n" + response);
+            String content = getResponseContent(response);
+            EntityUtils.consume(response.getEntity());
+            if (response.getStatusLine().getStatusCode() != HttpStatus.SC_OK && response.getStatusLine().getStatusCode() != HttpStatus.SC_CREATED) {
+                throw new BitbucketRequestException(response.getStatusLine().getStatusCode(), "HTTP request error. Status: " + response.getStatusLine().getStatusCode() + ": " + response.getStatusLine().getReasonPhrase() + ".\n" + response);
             }
-            return response;
+            return content;
         } catch (BitbucketRequestException e) {
             throw e;
         } catch (IOException e) {
@@ -646,15 +695,20 @@ public class BitbucketCloudApiClient implements BitbucketApi {
                 throw new IOException("Communication error", e);
             }
         } finally {
-            httppost.releaseConnection();
+            release(httppost);
         }
-
     }
 
-    private String getResponseContent(HttpMethod httppost, long len) throws IOException {
-        String response;
+    private void release(HttpRequestBase method) {
+        method.releaseConnection();
+        connectionManager.closeExpiredConnections();
+    }
+
+    private String getResponseContent(CloseableHttpResponse response) throws IOException {
+        String content;
+        long len = response.getEntity().getContentLength();
         if (len == 0) {
-            response = "";
+            content = "";
         } else {
             ByteArrayOutputStream buf;
             if (len > 0 && len <= Integer.MAX_VALUE / 2) {
@@ -662,29 +716,29 @@ public class BitbucketCloudApiClient implements BitbucketApi {
             } else {
                 buf = new ByteArrayOutputStream();
             }
-            try (InputStream is = httppost.getResponseBodyAsStream()) {
+            try (InputStream is = response.getEntity().getContent()) {
                 IOUtils.copy(is, buf);
             }
-            response = new String(buf.toByteArray(), StandardCharsets.UTF_8);
+            content = new String(buf.toByteArray(), StandardCharsets.UTF_8);
         }
-        return response;
+        return content;
     }
 
     private String putRequest(String path, String content) throws IOException, InterruptedException  {
-        PutMethod request = new PutMethod(path);
-        request.setRequestEntity(new StringRequestEntity(content, "application/json", "UTF-8"));
+        HttpPut request = new HttpPut(path);
+        request.setEntity(new StringEntity(content, ContentType.create("application/json", "UTF-8")));
         return doRequest(request);
     }
 
     private String postRequest(String path, String content) throws IOException, InterruptedException {
-        PostMethod httppost = new PostMethod(path);
-        httppost.setRequestEntity(new StringRequestEntity(content, "application/json", "UTF-8"));
+        HttpPost httppost = new HttpPost(path);
+        httppost.setEntity(new StringEntity(content, ContentType.create("application/json", "UTF-8")));
         return doRequest(httppost);
     }
 
-    private String postRequest(String path, NameValuePair[] params) throws IOException, InterruptedException {
-        PostMethod httppost = new PostMethod(path);
-        httppost.setRequestBody(params);
+    private String postRequest(String path, List<? extends NameValuePair> params) throws IOException, InterruptedException {
+        HttpPost httppost = new HttpPost(path);
+        httppost.setEntity(new UrlEncodedFormEntity(params));
         return doRequest(httppost);
     }
 
